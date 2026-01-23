@@ -427,6 +427,8 @@ class EngineCore:
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
+        print("Batch step")
+
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
