@@ -318,6 +318,7 @@ class KVCacheManager:
         # insufficient free blocks.
         # Should call this function before allocating new blocks to reduce
         # the number of evicted blocks.
+        # KVCOMPRESS_NOTE: we might be able to use this to deallocate blocks no longer in use
         self.coordinator.remove_skipped_blocks(
             request.request_id, total_computed_tokens
         )
