@@ -198,6 +198,9 @@ class HybridSparseAttentionMetadata:
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
 
+    seq_lens_cpu : list[int]
+    query_len : list[int]
+
     # For cascade attention.
     use_cascade: bool
     common_prefix_len: int
@@ -332,6 +335,8 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
         max_seq_len = common_attn_metadata.max_seq_len
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
+        seq_lens_cpu = common_attn_metadata.seq_lens.cpu().tolist()
+        query_len = common_attn_metadata.query_start_loc.diff().tolist()
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
         causal = common_attn_metadata.causal
@@ -485,6 +490,7 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
             query_start_loc=query_start_loc,
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
             block_table=block_table_tensor,
             slot_mapping=slot_mapping,
             max_dcp_context_kv_len=max_dcp_context_kv_len,
@@ -498,6 +504,7 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_num_splits=max_num_splits,
             causal=causal,
+            query_len=query_len,
         )
         return attn_metadata
 
@@ -711,6 +718,239 @@ class HybridSparseAttentionImpl(AttentionImpl):
                     if self.sliding_window is not None
                     else None
                 )
+
+                # KV_COMPRESS: this is not meant to be fast at all!
+                # Prototype for how researchers might implement an algorithm
+                # But yeah, this is garbage
+
+
+                # this code is not batched because vLLM likes to mixed prefill/decode
+                # this means we need to have separate paths depending on whether it is prefill or decode
+
+
+                block_size = key_cache.shape[1]
+
+                start_pos = 0
+                for i, qlen in enumerate(attn_metadata.query_len):
+                    end_pos = start_pos + qlen
+
+                    if qlen > 1:
+                        # Regular prefill using torch SDPA
+                        num_blocks = cdiv(attn_metadata.seq_lens_cpu[i], block_size)
+                        block_ids = block_table[i, :num_blocks] - 1
+                        
+                        # Gather the KV cache blocks for this sequence
+                        # key_cache shape: [num_blocks_total, block_size, num_kv_heads, head_dim]
+                        # We want: [num_kv_heads, total_kv_len, head_dim]
+                        k_blocks = key_cache[block_ids]  # [num_blocks, block_size, num_kv_heads, head_dim]
+                        v_blocks = value_cache[block_ids]  # [num_blocks, block_size, num_kv_heads, head_dim]
+                        
+                        # Flatten blocks into sequence dimension
+                        # [num_blocks, block_size, num_kv_heads, head_dim] -> [num_blocks * block_size, num_kv_heads, head_dim]
+                        k_seq = k_blocks.flatten(0, 1)  # [total_kv_len, num_kv_heads, head_dim]
+                        v_seq = v_blocks.flatten(0, 1)  # [total_kv_len, num_kv_heads, head_dim]
+                        
+                        # Trim to actual sequence length (remove padding from last block)
+                        actual_kv_len = attn_metadata.seq_lens_cpu[i]
+                        k_seq = k_seq[:actual_kv_len]  # [actual_kv_len, num_kv_heads, head_dim]
+                        v_seq = v_seq[:actual_kv_len]  # [actual_kv_len, num_kv_heads, head_dim]
+                        
+                        # Reshape query for this sequence
+                        # query shape at start_pos:end_pos is [qlen, num_heads, head_dim]
+                        q_seq = query[start_pos:end_pos]  # [qlen, num_heads, head_dim]
+                        
+                        # torch SDPA expects: [batch, num_heads, seq_len, head_dim]
+                        # Transpose to get correct shape (add batch dim of 1)
+                        q_sdpa = q_seq.transpose(0, 1).unsqueeze(0)  # [1, num_heads, qlen, head_dim]
+                        k_sdpa = k_seq.transpose(0, 1).unsqueeze(0)  # [1, num_kv_heads, actual_kv_len, head_dim]
+                        v_sdpa = v_seq.transpose(0, 1).unsqueeze(0)  # [1, num_kv_heads, actual_kv_len, head_dim]
+                        
+                        # Apply scaled dot product attention
+                        attn_out = torch.nn.functional.scaled_dot_product_attention(
+                            query=q_sdpa,
+                            key=k_sdpa,
+                            value=v_sdpa,
+                            attn_mask=None,  # Can add causal mask if needed
+                            dropout_p=0.0,
+                            is_causal=attn_metadata.causal,  # Use causal masking for prefill
+                            scale=self.scale,
+                            enable_gqa=True
+                        )
+                        
+                        # Remove batch dim and transpose back: [1, num_heads, qlen, head_dim] -> [qlen, num_heads, head_dim]
+                        attn_out = attn_out.squeeze(0).transpose(0, 1)
+                        
+                        # Store in output
+                        output[start_pos:end_pos] = attn_out
+                    else:
+                        # hybrid sparse attention
+                        num_blocks = cdiv(attn_metadata.seq_lens_cpu[i], block_size)
+
+                        # [num_blocks]
+                        block_ids = block_table[i, :num_blocks] - 1
+
+                        def _gather(t: torch.Tensor, dim: int, i: torch.Tensor) -> torch.Tensor:
+                            dim += (dim < 0) * t.ndim
+                            return t.gather(dim, i.expand(*t.shape[:dim], i.shape[dim], *t.shape[dim + 1 :]))
+
+                        # [blocks, page, kv head, d]
+                        block_pages = _gather(key_cache, 0, block_ids.view(-1, 1, 1, 1))
+                        block_vpges = _gather(value_cache, 0, block_ids.view(-1, 1, 1, 1))
+
+                        #print(f"uh have I been doing this wrong the entire time {block_pages.shape} {block_vpges.shape}")
+
+                        # I'm lazy, this isn't exact rocketkv but who cares (we need to use -inf/+inf for a rare edge case)
+                        # this needs to eventually get cached
+                        block_pages[-1, attn_metadata.seq_lens_cpu[i] % block_size + 1:] = 0
+
+                        # [blocks, page size, kv head, h dim] -> [block, kv head, dim]
+                        pagemax = block_pages.amax(dim=1)
+                        pagemin = block_pages.amin(dim=1)
+
+                        kv_heads = key.shape[1]
+                        # [1, head kv, q group, h dim]
+                        q_slice = query[start_pos:end_pos].unflatten(1, (kv_heads, -1))
+                        # final shape: [1, head kv, h dim]
+                        q_prime = q_slice.sum(2)
+
+                        # [blocks, head kv, h dim]
+                        page_sel = torch.where(q_prime < 0, pagemin, pagemax)
+
+                        # r in our original code
+                        r_comp = 16
+
+                        # [1, head kv, h dim]
+                        q_dsel = q_slice.abs().sum(2)
+
+                        # [1, head kv, r_comp]
+                        hd_top = torch.topk(q_dsel, k=r_comp, dim=-1).indices
+
+                        # collect along last dim, apply the same reduction to all in kv group
+                        # [1, head kv, q group, r_comp]
+                        q_hat = _gather(q_slice , dim=-1, i=hd_top.unsqueeze(2))
+                        #print(f"So the thing we get back is {q_hat.shape} {q_slice.shape} {hd_top.unsqueeze(2).shape}")
+                        q_hat = q_hat.squeeze(0) # [head kv, q group, r_comp]
+                        # [blocks, head kv, r_comp]
+                        k_hat = _gather(page_sel, dim=-1, i=hd_top)
+                        k_hat = k_hat.transpose(0, 1) # push head to first dimension [head kv, blocks, r_comp]
+                        k_hat = k_hat.transpose(1, 2) # swap for attn comp
+
+                        # [head kv, q group, r_comp] x [head kv,  r_comp, blocks] = [head kv, q group, blocks]
+                        qk_hat = torch.matmul(q_hat, k_hat)
+                        # [head kv, q group, 1]
+                        scale_factor = torch.sqrt(
+                            q_slice.shape[-1] 
+                            * q_hat.abs().sum(dim=-1, keepdim=True) 
+                            / q_slice.squeeze(0).abs().sum(dim=-1, keepdim=True)
+                        )
+
+                        # [head kv, q group, blocks]
+                        smax = torch.softmax(
+                            qk_hat / scale_factor,
+                            dim=-1, 
+                        )
+
+                        # [head kv, blocks]
+                        #print(f"I need to know {q_slice.shape} {q_hat.shape} {k_hat.shape} {qk_hat.shape} {smax.shape}")
+                        smax = smax.mean(dim=1)
+
+                        block_budget = min(num_blocks, 16)
+                        if block_budget < num_blocks:
+                            print("TOKEN BUDGET LESS THAN STUFF")
+
+                        # [head kv, block_budget]
+                        #print(f"BUDGET {block_budget} {num_blocks} {smax.shape}")
+                        top_blocks = torch.topk(smax, block_budget, dim=-1).indices
+                        #print(f"SHAPE {top_blocks.shape}")
+                        # [block budget, head kv]
+                        top_blocks = top_blocks.transpose(0, 1)
+                        # [block budget, 1, head kv, 1]
+                        top_blocks = top_blocks.unsqueeze(-1).unsqueeze(1)
+                        #print(f"SHAPE 2 {top_blocks.shape}")
+                        #print(f"SHAPE 3 {_gather(block_pages, dim=0, i=top_blocks).shape}")
+
+                        # [block budget, page size, head kv, hiddn dim]
+                        sel_blocks = _gather(block_pages, dim=0, i=top_blocks).flatten(0, 1).transpose(0, 1)
+                        sel_values = _gather(block_vpges, dim=0, i=top_blocks).flatten(0, 1).transpose(0, 1)
+                        #print(f"Q is {query[start_pos:end_pos].transpose(0, 1).shape} K is {sel_blocks.shape} V is {sel_values.shape}")
+
+                        # assume last block always gets chosen
+                        block_budget = num_blocks
+                        attn_mask = torch.arange(block_budget * block_size, device=query.device) <= ((attn_metadata.seq_lens_cpu[i] % block_size) + (block_budget - 1) * block_size)
+                        attn_mask = attn_mask.unsqueeze(0)
+                        #print(f"Q is {query[start_pos:end_pos].transpose(0, 1).shape} K is {block_pages.flatten(0, 1).transpose(0, 1).shape} V is {block_vpges.flatten(0, 1).transpose(0, 1).shape}")
+
+                        o_tensor = torch.nn.functional.scaled_dot_product_attention(
+                            query=query[start_pos:end_pos].transpose(0, 1),
+                            key=block_pages.flatten(0, 1).transpose(0, 1),
+                            value=block_vpges.flatten(0, 1).transpose(0, 1),
+                            attn_mask=attn_mask,
+                            enable_gqa=True
+                        ).transpose(0, 1)
+
+
+                        # manual attention - deal with attn mask later
+                        output[start_pos:end_pos] = o_tensor
+
+                    start_pos = end_pos
+
+                return output
+
+                #print(f"HEY HELLO {cu_seqlens_q.shape} {block_table.cpu()}")
+                b_seqused_k = seqused_k.unsqueeze(-1)
+
+                # min/max of KV cache
+                # elimates block size dim, new dim:
+                # [num blocks, head kv, dims]
+                pagemax = key_cache.amax(dim=1)
+                pagemin = key_cache.amin(dim=1)
+
+                #print(f"BLK TABLE {block_table.shape} SEQ USED {b_seqused_k.shape} {b_seqused_k}")
+
+                # gather last blocks
+
+                # zero block not allocated 
+                # also round down, e.g. seq uzed 16 when block size is 16 should still map to 1
+                num_blocks_used = (b_seqused_k - 1).clamp_min(0) // block_size
+                last_block_idx = block_table.gather(dim=1, index=num_blocks_used) - 1 
+                #print(f"STUFF {key_cache.shape} {last_block_idx.shape}")
+
+                # key cache: [blocks, block size, head kv, dims]
+                # last block idx: [batch, 1]
+                # target size is: [batch, block size, headkv, dims]
+                # rely on broadcasting?
+                last_block_keys = key_cache.gather(dim=0, index=last_block_idx.unsqueeze(-1).unsqueeze(-1))
+
+
+
+                # min/max of last blocks
+                # need to do arange unfortunately... ideally cache this
+                last_used_seqkey = b_seqused_k % block_size
+                block_arange = torch.arange(block_size, device=last_block_keys.device).unsqueeze(0).expand(b_seqused_k.shape[0], -1)
+
+                last_max = torch.where(block_arange <= last_used_seqkey, last_block_keys, -torch.inf).amax(dim=1)
+                last_min = torch.where(block_arange <= last_used_seqkey, last_block_keys,  torch.inf).amin(dim=1)
+
+                # scatter in last block
+                # last block idx: [batch, 1]
+                # pagemax cache: [block size, headkv, dims]
+                # unsqueeze, rely on braodcasting
+                pagemax.scatter_(dim=0, index=last_block_idx.unsqueeze(-1), src=last_max)
+                pagemin.scatter_(dim=0, index=last_block_idx.unsqueeze(-1), src=last_min)
+
+                # code from here on out is not batched, since vLLM likes to do mixed prefill and decode
+
+                # for each query gather our pages into (batch size, max pages)
+                gather_table = (block_table.clamp_min(1) - 1).unsqueeze(-1).unsqueeze(-1)
+                #req_pagemax = pagemax.unsqueeze(0).gather(dim=1, gather_table)
+
+                # TODO: mult queries with respective pages 
+
+                # TODO: take top-k pages
+
+                # TODO: adjust seq lens and pass to flash attention
+
+
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,
