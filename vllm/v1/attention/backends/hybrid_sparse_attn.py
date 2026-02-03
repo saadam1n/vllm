@@ -727,6 +727,32 @@ class HybridSparseAttentionImpl(AttentionImpl):
                 # this code is not batched because vLLM likes to mixed prefill/decode
                 # this means we need to have separate paths depending on whether it is prefill or decode
 
+                # let's assume decode is done via our impl
+                flash_attn_varlen_func(
+                    q=query[:num_actual_tokens],
+                    k=key_cache,
+                    v=value_cache,
+                    out=output[:num_actual_tokens],
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    seqused_k=seqused_k,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=self.scale,
+                    causal=attn_metadata.causal,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=sliding_window_size,
+                    block_table=block_table,
+                    softcap=self.logits_soft_cap,
+                    scheduler_metadata=scheduler_metadata,
+                    fa_version=self.vllm_flash_attn_version,
+                    q_descale=layer._q_scale.expand(descale_shape),
+                    k_descale=layer._k_scale.expand(descale_shape),
+                    v_descale=layer._v_scale.expand(descale_shape),
+                    num_splits=attn_metadata.max_num_splits,
+                    s_aux=self.sinks,
+                )
+
+                raw_output = output.clone()
 
                 block_size = key_cache.shape[1]
 
@@ -735,9 +761,10 @@ class HybridSparseAttentionImpl(AttentionImpl):
                     end_pos = start_pos + qlen
 
                     if qlen > 1:
+                        #print(f"PREFILL")
                         # Regular prefill using torch SDPA
                         num_blocks = cdiv(attn_metadata.seq_lens_cpu[i], block_size)
-                        block_ids = block_table[i, :num_blocks] - 1
+                        block_ids = block_table[i, :num_blocks]
                         
                         # Gather the KV cache blocks for this sequence
                         # key_cache shape: [num_blocks_total, block_size, num_kv_heads, head_dim]
@@ -770,7 +797,6 @@ class HybridSparseAttentionImpl(AttentionImpl):
                             query=q_sdpa,
                             key=k_sdpa,
                             value=v_sdpa,
-                            attn_mask=None,  # Can add causal mask if needed
                             dropout_p=0.0,
                             is_causal=attn_metadata.causal,  # Use causal masking for prefill
                             scale=self.scale,
@@ -782,30 +808,38 @@ class HybridSparseAttentionImpl(AttentionImpl):
                         
                         # Store in output
                         output[start_pos:end_pos] = attn_out
+
                     else:
+                        #print(f"DECODE")
+
                         # hybrid sparse attention
                         num_blocks = cdiv(attn_metadata.seq_lens_cpu[i], block_size)
 
                         # [num_blocks]
-                        block_ids = block_table[i, :num_blocks] - 1
+                        block_ids = block_table[i, :num_blocks]
 
                         def _gather(t: torch.Tensor, dim: int, i: torch.Tensor) -> torch.Tensor:
                             dim += (dim < 0) * t.ndim
                             return t.gather(dim, i.expand(*t.shape[:dim], i.shape[dim], *t.shape[dim + 1 :]))
 
                         # [blocks, page, kv head, d]
-                        block_pages = _gather(key_cache, 0, block_ids.view(-1, 1, 1, 1))
-                        block_vpges = _gather(value_cache, 0, block_ids.view(-1, 1, 1, 1))
+                        block_k = key_cache[block_ids] # _gather(key_cache, 0, block_ids.view(-1, 1, 1, 1))
+                        block_v = value_cache[block_ids] #_gather(value_cache, 0, block_ids.view(-1, 1, 1, 1))
+
+                        nb_pg_sz = block_k.shape[:2]
+                        block_k = block_k.flatten(0, 1)
+                        block_k[attn_metadata.seq_lens_cpu[i]:] = 0
+                        block_k = block_k.unflatten(0, nb_pg_sz)
 
                         #print(f"uh have I been doing this wrong the entire time {block_pages.shape} {block_vpges.shape}")
 
                         # I'm lazy, this isn't exact rocketkv but who cares (we need to use -inf/+inf for a rare edge case)
                         # this needs to eventually get cached
-                        block_pages[-1, attn_metadata.seq_lens_cpu[i] % block_size + 1:] = 0
+                        #block_pages[-1, attn_metadata.seq_lens_cpu[i] % block_size + 1:] = 0
 
                         # [blocks, page size, kv head, h dim] -> [block, kv head, dim]
-                        pagemax = block_pages.amax(dim=1)
-                        pagemin = block_pages.amin(dim=1)
+                        pagemax = block_k.amax(dim=1)
+                        pagemin = block_k.amin(dim=1)
 
                         kv_heads = key.shape[1]
                         # [1, head kv, q group, h dim]
@@ -844,6 +878,12 @@ class HybridSparseAttentionImpl(AttentionImpl):
                             / q_slice.squeeze(0).abs().sum(dim=-1, keepdim=True)
                         )
 
+
+                        # exclude the last block, since we will force add that back
+                        # this deviates from rocketkv a bit but basically garauntees behavior
+                        # that was 99% likely to occur anyways 
+                        qk_hat = qk_hat[:, :, :-1]
+
                         # [head kv, q group, blocks]
                         smax = torch.softmax(
                             qk_hat / scale_factor,
@@ -854,13 +894,21 @@ class HybridSparseAttentionImpl(AttentionImpl):
                         #print(f"I need to know {q_slice.shape} {q_hat.shape} {k_hat.shape} {qk_hat.shape} {smax.shape}")
                         smax = smax.mean(dim=1)
 
-                        block_budget = min(num_blocks, 16)
+                        max_block_budget = 16
+                        block_budget = min(num_blocks - 1, max_block_budget - 1)
                         if block_budget < num_blocks:
-                            print("TOKEN BUDGET LESS THAN STUFF")
+                            #print("TOKEN BUDGET LESS THAN STUFF")
+                            pass
 
                         # [head kv, block_budget]
                         #print(f"BUDGET {block_budget} {num_blocks} {smax.shape}")
                         top_blocks = torch.topk(smax, block_budget, dim=-1).indices
+                        top_blocks = torch.cat(
+                            [
+                                top_blocks, torch.full_like(top_blocks[:, :1], fill_value=num_blocks - 1)
+                            ],
+                            dim=-1
+                        )
                         #print(f"SHAPE {top_blocks.shape}")
                         # [block budget, head kv]
                         top_blocks = top_blocks.transpose(0, 1)
@@ -870,21 +918,24 @@ class HybridSparseAttentionImpl(AttentionImpl):
                         #print(f"SHAPE 3 {_gather(block_pages, dim=0, i=top_blocks).shape}")
 
                         # [block budget, page size, head kv, hiddn dim]
-                        sel_blocks = _gather(block_pages, dim=0, i=top_blocks).flatten(0, 1).transpose(0, 1)
-                        sel_values = _gather(block_vpges, dim=0, i=top_blocks).flatten(0, 1).transpose(0, 1)
-                        #print(f"Q is {query[start_pos:end_pos].transpose(0, 1).shape} K is {sel_blocks.shape} V is {sel_values.shape}")
+                        sel_k = _gather(block_k, dim=0, i=top_blocks).flatten(0, 1).transpose(0, 1)
+                        sel_v = _gather(block_v, dim=0, i=top_blocks).flatten(0, 1).transpose(0, 1)
 
-                        # assume last block always gets chosen
-                        block_budget = num_blocks
-                        attn_mask = torch.arange(block_budget * block_size, device=query.device) <= ((attn_metadata.seq_lens_cpu[i] % block_size) + (block_budget - 1) * block_size)
-                        attn_mask = attn_mask.unsqueeze(0)
-                        #print(f"Q is {query[start_pos:end_pos].transpose(0, 1).shape} K is {block_pages.flatten(0, 1).transpose(0, 1).shape} V is {block_vpges.flatten(0, 1).transpose(0, 1).shape}")
+                        # if num blocks is 16 and max block budget is 16
+                        # then block budget will be 15
+                        # thus subtract 1 to remove bad offset
+                        culled_blocks = num_blocks - block_budget - 1
+                        culled_seqlen = attn_metadata.seq_lens_cpu[i] - block_size * culled_blocks
+
+                        sel_k = sel_k[:, :culled_seqlen]
+                        sel_v = sel_v[:, :culled_seqlen]
 
                         o_tensor = torch.nn.functional.scaled_dot_product_attention(
                             query=query[start_pos:end_pos].transpose(0, 1),
-                            key=block_pages.flatten(0, 1).transpose(0, 1),
-                            value=block_vpges.flatten(0, 1).transpose(0, 1),
-                            attn_mask=attn_mask,
+                            key=sel_k,
+                            value=sel_v,
+                            #attn_mask=attn_mask,
+                            scale=self.scale,
                             enable_gqa=True
                         ).transpose(0, 1)
 
@@ -894,6 +945,36 @@ class HybridSparseAttentionImpl(AttentionImpl):
 
                     start_pos = end_pos
 
+                return output
+
+
+                # Calculate various error metrics
+                attn_diff = output - raw_output
+                l1_error = torch.nn.functional.l1_loss(output, raw_output)
+                l2_error = torch.nn.functional.mse_loss(output, raw_output)
+                max_error = torch.max(torch.abs(attn_diff))
+                mean_error = torch.mean(attn_diff)
+                std_error = torch.std(attn_diff)
+
+                # Relative errors (avoid division by zero)
+                raw_norm = torch.norm(raw_output)
+                if raw_norm > 1e-8:
+                    rel_l1_error = l1_error / (torch.mean(torch.abs(raw_output)) + 1e-8)
+                    rel_l2_error = torch.sqrt(l2_error) / raw_norm
+                else:
+                    rel_l1_error = float('inf')
+                    rel_l2_error = float('inf')
+
+                print(f"Attention Error Statistics:")
+                print(f"  L1 Loss (MAE):        {l1_error:.6e}")
+                print(f"  L2 Loss (MSE):        {l2_error:.6e}")
+                print(f"  RMSE:                 {torch.sqrt(l2_error):.6e}")
+                print(f"  Max Absolute Error:   {max_error:.6e}")
+                print(f"  Mean Error (bias):    {mean_error:.6e}")
+                print(f"  Std Dev of Error:     {std_error:.6e}")
+                print(f"  Relative L1 Error:    {rel_l1_error:.6e}")
+                print(f"  Relative L2 Error:    {rel_l2_error:.6e}")
+                print(f"  Raw output norm:      {raw_norm:.6e}")
                 return output
 
                 #print(f"HEY HELLO {cu_seqlens_q.shape} {block_table.cpu()}")
