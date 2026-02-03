@@ -727,33 +727,6 @@ class HybridSparseAttentionImpl(AttentionImpl):
                 # this code is not batched because vLLM likes to mixed prefill/decode
                 # this means we need to have separate paths depending on whether it is prefill or decode
 
-                # let's assume decode is done via our impl
-                flash_attn_varlen_func(
-                    q=query[:num_actual_tokens],
-                    k=key_cache,
-                    v=value_cache,
-                    out=output[:num_actual_tokens],
-                    cu_seqlens_q=cu_seqlens_q,
-                    max_seqlen_q=max_seqlen_q,
-                    seqused_k=seqused_k,
-                    max_seqlen_k=max_seqlen_k,
-                    softmax_scale=self.scale,
-                    causal=attn_metadata.causal,
-                    alibi_slopes=self.alibi_slopes,
-                    window_size=sliding_window_size,
-                    block_table=block_table,
-                    softcap=self.logits_soft_cap,
-                    scheduler_metadata=scheduler_metadata,
-                    fa_version=self.vllm_flash_attn_version,
-                    q_descale=layer._q_scale.expand(descale_shape),
-                    k_descale=layer._k_scale.expand(descale_shape),
-                    v_descale=layer._v_scale.expand(descale_shape),
-                    num_splits=attn_metadata.max_num_splits,
-                    s_aux=self.sinks,
-                )
-
-                raw_output = output.clone()
-
                 block_size = key_cache.shape[1]
 
                 start_pos = 0
