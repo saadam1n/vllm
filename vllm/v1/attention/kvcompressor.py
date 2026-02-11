@@ -12,6 +12,15 @@ import torch
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
+from vllm.v1.core.single_type_kv_cache_manager import (
+    SingleTypeKVCacheManager
+)
+
+from vllm.v1.core.kv_cache_manager import (
+    KVCacheManager
+)
+
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
@@ -188,6 +197,21 @@ class KVCompressorBackend(ABC):
             device: The device to use for tensor operations.
         """
         raise NotImplementedError
+    
+    def evict_block_id(
+        self, 
+        block_id: int
+    ):
+        """
+        Docstring for evict_block_id
+        
+        :param self: Description
+        :param block_id: Description
+        :type block_id: int
+
+        Manually evict a block ID
+        """
+        pass
 
     # -------------------------------------------------------------------------
     # Request Lifecycle Methods

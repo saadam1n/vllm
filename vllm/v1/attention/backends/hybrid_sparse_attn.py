@@ -52,6 +52,10 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm.v1.attention.kvcompressor import (
+    KVCompressorBackend
+)
+
 logger = init_logger(__name__)
 
 
@@ -522,6 +526,103 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
     def use_cascade_attention(self, *args, **kwargs) -> bool:
         return use_cascade_attention(*args, **kwargs)
 
+class HybridSparseAttentionKVCompressorBackend(KVCompressorBackend):
+    """KV compressor backend for hybrid sparse attention.
+
+    This compressor tracks per-request state for sparse attention patterns,
+    managing block-level statistics (min/max) for efficient page selection
+    during decode.
+
+    A KV compressor backend provides the following functionality:
+    - A fixed eviction schedule for blocks. Since KV cache management is done
+    CPU side and we want to avoid CPU <-> GPU syncs, we evict blocks in predicatble 
+    patterns (such as the oldest block allocated). If you wish to save this data,
+    make sure to move the KV cache data you wish to save accordingly.
+    - State management for any auxiliary data. For instance, if you want to run a backend
+    that uses HSA with a LRU eviction policy, you can maintain a LRU table between requests
+    and have this table loaded at runtime. The best way to do this is augmenting attn_metadata
+    with the information you need from a cache.
+    """
+
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
+
+    @staticmethod
+    def get_name() -> str:
+        return "HYBRID_SPARSE_ATTN"
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ) -> None:
+        self.vllm_config = vllm_config
+        self.device = device
+
+        self.manager = None
+
+        # Per-request state tracking
+        # Maps request_id -> request state dict
+        self._request_states: dict[str, dict] = {}
+
+    # -------------------------------------------------------------------------
+    # Request Lifecycle Methods
+    # -------------------------------------------------------------------------
+
+    def add_request(
+        self,
+        request_id: str,
+        seq_len: int,
+    ) -> None:
+        """Initialize state for a new request."""
+        self._request_states[request_id] = {
+            "seq_len": seq_len,
+            # Add any per-request compression state here, e.g.:
+            # "block_stats": None,  # Cached block min/max statistics
+            # "page_importance": None,  # Page importance scores
+        }
+
+    def remove_request(
+        self,
+        request_id: str,
+    ) -> None:
+        """Clean up state for a finished request."""
+        self._request_states.pop(request_id, None)
+
+    def on_seq_increment(
+        self,
+        request_id: str,
+        new_seq_len: int,
+    ) -> None:
+        """Update state when a request's sequence length increases by 1."""
+        if request_id in self._request_states:
+            state = self._request_states[request_id]
+            state["seq_len"] = new_seq_len
+            # Update any cached compression state here, e.g.:
+            # - Invalidate/update block statistics for the last block
+            # - Recompute page importance if needed
+
+    # -------------------------------------------------------------------------
+    # Optional Batch-Level Methods
+    # -------------------------------------------------------------------------
+
+    def on_batch_start(
+        self,
+        request_ids: list[str],
+    ) -> None:
+        """Called at the start of processing a batch."""
+        # Pre-compute any batch-level compression state here
+        pass
+
+    def on_batch_end(
+        self,
+        request_ids: list[str],
+    ) -> None:
+        """Called at the end of processing a batch."""
+        # Finalize any batch-level compression operations here
+        pass
+
+
+
 
 class HybridSparseAttentionImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
@@ -735,6 +836,11 @@ class HybridSparseAttentionImpl(AttentionImpl):
 
                     if qlen > 1:
                         #print(f"PREFILL")
+
+                        # skip snapkv
+                        # most reasoning prompts have short prefill
+                        # and idrc about prefill for this short test
+
                         # Regular prefill using torch SDPA
                         num_blocks = cdiv(attn_metadata.seq_lens_cpu[i], block_size)
                         block_ids = block_table[i, :num_blocks]

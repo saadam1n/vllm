@@ -266,6 +266,30 @@ class SingleTypeKVCacheManager(ABC):
         self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
 
+    def partial_free(self, request_id: str, num_evictions : int) -> None:
+        """
+        Docstring for partial_free
+        
+        :param self: Description
+        :param request_id: Description
+        :type request_id: str
+        :param block_ids: Description
+        :type block_ids: list[int]
+        """
+        req_blocks = self.req_to_blocks.get(request_id, [])
+
+        assert len(req_blocks) <= num_evictions
+
+        ordered_blocks = reversed(req_blocks)
+
+        ordered_blocks = ordered_blocks[:num_evictions]
+
+        self.block_pool.free_blocks(ordered_blocks)
+        self.num_cached_block[request_id] -= num_evictions
+
+
+
+
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
