@@ -202,8 +202,18 @@ class HybridSparseAttentionMetadata:
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
 
+    # Max blocks used in HSA decode requests
+    max_block_budget : int
+
     seq_lens_cpu : list[int]
-    query_len : list[int]
+    query_len_cpu : list[int]
+
+    # post-HSA block table (this is mutable!)
+    scratch_table : torch.Tensor
+    # post-HSA sequence length
+    hsa_seqused_k : list[int]
+    # post-HSA max sequence length
+    hsa_max_seqlen_k : int
 
     # For cascade attention.
     use_cascade: bool
@@ -284,6 +294,8 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
         self.headdim = self.model_config.get_head_size()
         self.block_size = kv_cache_spec.block_size
 
+        logger.warning(f"Using the block sizes that vLLM already uses for the KV cache (i.e. {self.block_size}) as the HSA block size.")
+
         self.max_num_splits = 0  # No upper bound on the number of splits.
         self.aot_schedule = get_flash_attn_version() == 3
 
@@ -323,6 +335,9 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
         # populated on first build() call.
         self.aot_sliding_window: tuple[int, int] | None = None
 
+        self.max_block_budget = 16
+        logger.warning(f"ALERT: max blocks for HSA has been hard-coded to {self.max_block_budget}! This needs to be changed into a vLLM argument at some point!")
+
     def build(
         self,
         common_prefix_len: int,
@@ -339,11 +354,29 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
         max_seq_len = common_attn_metadata.max_seq_len
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
-        seq_lens_cpu = common_attn_metadata.seq_lens.cpu().tolist()
-        query_len = common_attn_metadata.query_start_loc.diff().tolist()
+        query_len = common_attn_metadata.query_start_loc.diff()
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
         causal = common_attn_metadata.causal
+
+        # perform cdiv
+        reqs_num_blocks = torch.floor_divide(seq_lens - 1, self.block_size) + 1
+        reqs_decode_budget = reqs_num_blocks.clamp_max(self.max_block_budget)
+
+        reqs_decode_seqlen = (reqs_decode_budget - reqs_num_blocks) * self.block_size + seq_lens
+
+        decode_req = (query_len == 1)
+
+        hsa_seqused_k = torch.where(decode_req, reqs_decode_seqlen, seq_lens)
+        scratch_table = torch.where(decode_req.unsqueeze(1), 0, block_table_tensor)
+
+
+        hsa_max_seqlen_k = reqs_decode_seqlen.amax().item()
+
+        seq_lens_cpu = common_attn_metadata.seq_lens.cpu().tolist()
+        query_len_cpu = query_len.cpu().tolist()
+
+
 
         # the overhead of the aot schedule is not worth it for spec-decode
         aot_schedule = self.aot_schedule and not fast_build
@@ -508,7 +541,11 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_num_splits=max_num_splits,
             causal=causal,
-            query_len=query_len,
+            query_len_cpu=query_len_cpu,
+            max_block_budget=self.max_block_budget,
+            hsa_seqused_k=hsa_seqused_k,
+            hsa_max_seqlen_k=hsa_max_seqlen_k,
+            scratch_table=scratch_table
         )
         return attn_metadata
 
@@ -833,32 +870,13 @@ class HybridSparseAttentionImpl(AttentionImpl):
 
                 block_size = key_cache.shape[1]
 
-                # output from the HSA prologue 
-                # selected blocks
-                hsa_sel_blocks = []
-                # sequence length
-                hsa_seqused_k = []
-                # max sequence length
-                hsa_max_seqlen_k = 0
+                scratch_table = attn_metadata.scratch_table
 
                 start_pos = 0
-                for i, qlen in enumerate(attn_metadata.query_len):
+                for i, qlen in enumerate(attn_metadata.query_len_cpu):
                     end_pos = start_pos + qlen
 
-                    if qlen > 1:
-                        # Prefill
-                        num_blocks = cdiv(attn_metadata.seq_lens_cpu[i], block_size)
-                        block_ids = block_table[i, :num_blocks]
-                        
-                        hsa_sel_blocks.append(block_ids)
-
-                        prefill_seqlen = attn_metadata.seq_lens_cpu[i]
-                        hsa_seqused_k.append(prefill_seqlen)
-
-                        # update max sequence length
-                        hsa_max_seqlen_k = max(hsa_max_seqlen_k, prefill_seqlen)
-
-                    else:
+                    if qlen == 1:
                         # Decode
 
                         # hybrid sparse attention
@@ -866,10 +884,6 @@ class HybridSparseAttentionImpl(AttentionImpl):
 
                         # [num_blocks]
                         block_ids = block_table[i, :num_blocks]
-
-                        def _gather(t: torch.Tensor, dim: int, i: torch.Tensor) -> torch.Tensor:
-                            dim += (dim < 0) * t.ndim
-                            return t.gather(dim, i.expand(*t.shape[:dim], i.shape[dim], *t.shape[dim + 1 :]))
 
                         # [blocks, page, kv head, d]
                         block_k = key_cache[block_ids] 
@@ -923,12 +937,7 @@ class HybridSparseAttentionImpl(AttentionImpl):
                         # force implicit selection of the last block
                         qk_hat[-1:] += 1000
 
-
-                        max_block_budget = 16
-                        block_budget = min(num_blocks, max_block_budget)
-                        if block_budget < num_blocks:
-                            #print("Note: we are skipping some blocks for attention!")
-                            pass
+                        block_budget = min(num_blocks, attn_metadata.max_block_budget)
 
                         # [block_budget]
                         sel_blocks = torch.topk(qk_hat, block_budget, dim=-1).indices
@@ -940,39 +949,18 @@ class HybridSparseAttentionImpl(AttentionImpl):
                         # if it does not, then garbage data to the left of it will be attended to
                         # which I suspect leads to degeneration
                         # in the real kernel we would probably manually handle this... somehow
-                        # idk how to do it in triton but we could do:
+                        # idk how to do it in triton but we could do the following in CUDA:
                         #   if selected top k block is last
-                        #      swap with last block
+                        #      smem swap with last block // no race conditions here
                         sel_blocks = torch.sort(sel_blocks).values
 
                         # [block_budget]
                         sel_block_ids = torch.gather(block_ids, dim=0, index=sel_blocks)
 
-                        hsa_sel_blocks.append(sel_block_ids)
-
-                        # now calculate the sequence length
-                        # we will always have (block_budget - 1) full blocks in our KV cache
-                        decode_seqlen = (block_budget - 1) * block_size
-
-                        # the number of tokens in the last block is given by:
-                        decode_seqlen = decode_seqlen + attn_metadata.seq_lens_cpu[i] - (num_blocks - 1) * block_size
-
-                        hsa_seqused_k.append(decode_seqlen)
-                        hsa_max_seqlen_k = max(hsa_max_seqlen_k, decode_seqlen)
-
+                        scratch_table[i, :block_budget] = sel_block_ids
 
                     start_pos = end_pos
 
-
-                # note: originally doing this from the raw list
-                hsa_seqused_k = seqused_k.new_tensor(hsa_seqused_k)
-
-                # essentially pads all values to a new len
-                hsa_sel_blocks = torch.nn.utils.rnn.pad_sequence(
-                    hsa_sel_blocks, 
-                    batch_first=True, 
-                    padding_value=0
-                )
 
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
@@ -981,13 +969,13 @@ class HybridSparseAttentionImpl(AttentionImpl):
                     out=output[:num_actual_tokens],
                     cu_seqlens_q=cu_seqlens_q,
                     max_seqlen_q=max_seqlen_q,
-                    seqused_k=hsa_seqused_k, # HSA SPECIFIC INPUT
-                    max_seqlen_k=hsa_max_seqlen_k, # HSA SPECIFIC INPUT
+                    seqused_k=attn_metadata.hsa_seqused_k, # HSA SPECIFIC INPUT
+                    max_seqlen_k=attn_metadata.hsa_max_seqlen_k, # HSA SPECIFIC INPUT
                     softmax_scale=self.scale,
                     causal=attn_metadata.causal,
                     alibi_slopes=self.alibi_slopes,
                     window_size=sliding_window_size,
-                    block_table=hsa_sel_blocks, # HSA SPECIFIC INPUT
+                    block_table=scratch_table, # HSA SPECIFIC INPUT
                     softcap=self.logits_soft_cap,
                     scheduler_metadata=scheduler_metadata,
                     fa_version=self.vllm_flash_attn_version,
