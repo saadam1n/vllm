@@ -885,6 +885,21 @@ class HybridSparseAttentionImpl(AttentionImpl):
                         # [num_blocks]
                         block_ids = block_table[i, :num_blocks]
 
+                        # first thing I want to move into custom kernel is page min/max caching
+                        # since that is a very low hanging fruit
+
+                        # in the real kernel, we keep the page min/max cache
+                        # we can make our updates stateless, i.e. if an update writes to the first KV cache block, we clear it
+                        # most efficient way to do this just pytorch ops for now? torch.scatter
+                        # for that we would
+                        #   read the key
+                        #   figure out whether we are updating or clearing 
+                        #   calculate both!
+                        #   use torch.where to figure out which one we select
+                        #   scatter back
+                        # note this contains lots of memory traffic and is inefficient 
+
+
                         # [blocks, page, kv head, d]
                         block_k = key_cache[block_ids] 
 
@@ -892,12 +907,28 @@ class HybridSparseAttentionImpl(AttentionImpl):
                         # for the actual kernel, we would use min/max paging to help calculate this 
                         nb_pg_sz = block_k.shape[:2]
                         block_k = block_k.flatten(0, 1)
-                        block_k[attn_metadata.seq_lens_cpu[i]:] = 0
-                        block_k = block_k.unflatten(0, nb_pg_sz)
+
+                        # Create mask for padded entries
+                        mask = torch.ones_like(block_k, dtype=torch.bool)
+                        mask[attn_metadata.seq_lens_cpu[i]:] = False
+
+                        # Set padded entries to -inf for max and +inf for min
+                        block_k_max = block_k.clone()
+                        block_k_min = block_k.clone()
+                        block_k_max[~mask] = float('-inf')
+                        block_k_min[~mask] = float('inf')
+
+                        # Unflatten back to original shape
+                        block_k_max = block_k_max.unflatten(0, nb_pg_sz)
+                        block_k_min = block_k_min.unflatten(0, nb_pg_sz)
 
                         # [blocks, page size, kv head, h dim] -> [block, kv head, dim]
-                        pagemax = block_k.amax(dim=1)
-                        pagemin = block_k.amin(dim=1)
+                        pagemax = block_k_max.amax(dim=1)
+                        pagemin = block_k_min.amin(dim=1)
+
+                        # Restore original block_k
+                        block_k[attn_metadata.seq_lens_cpu[i]:] = 0
+                        block_k = block_k.unflatten(0, nb_pg_sz)
 
                         kv_heads = key.shape[1]
                         # [1, head kv, q group, h dim]
