@@ -160,10 +160,19 @@ class BlockPool:
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
         ]
+
+        # KV_COMPRESS: add config that allows us to reserve the last n blocks in the pool
+        # this is useful for storing auxiliary information in each layer 
+
+        reservation_ratio = 0.2
+        usable_blocks = int((1 - reservation_ratio) * num_gpu_blocks)
+
+        logger.warning(f"KV_COMPRESS: Using a hardcoded reservation ratio: {reservation_ratio}. Will allocate {num_gpu_blocks} in total, {usable_blocks} will be usable and {num_gpu_blocks - usable_blocks} will be reserved")
+
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks[:usable_blocks])
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
