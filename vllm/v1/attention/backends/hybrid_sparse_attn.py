@@ -56,6 +56,10 @@ from vllm.v1.attention.kvcompressor import (
     KVCompressorBackend
 )
 
+from vllm.v1.attention.ops.triton_hsa_selection import (
+    update_page_minmax
+)
+
 logger = init_logger(__name__)
 
 
@@ -868,6 +872,19 @@ class HybridSparseAttentionImpl(AttentionImpl):
                 # the number of columns is the maximum number of blocks used as per the HSA config
                 # side note: we can combine this with a LRU-style cache to find out which pages to evict
 
+                update_page_minmax(
+                    query_start_loc=cu_seqlens_q,
+                    slot_mapping=attn_metadata.slot_mapping,
+                    key=key,
+                    key_cache=key_cache,
+                    value_cache=value_cache
+                )
+
+
+                # pls do not create a copy
+                kf_cache = key_cache.flatten(0, 1)
+                vf_cache = value_cache.flatten(0, 1)
+
                 block_size = key_cache.shape[1]
 
                 scratch_table = attn_metadata.scratch_table
@@ -885,50 +902,13 @@ class HybridSparseAttentionImpl(AttentionImpl):
                         # [num_blocks]
                         block_ids = block_table[i, :num_blocks]
 
-                        # first thing I want to move into custom kernel is page min/max caching
-                        # since that is a very low hanging fruit
+                        # [num_blocks]
+                        ld_indices = kf_cache.shape[0] - block_ids
 
-                        # in the real kernel, we keep the page min/max cache
-                        # we can make our updates stateless, i.e. if an update writes to the first KV cache block, we clear it
-                        # most efficient way to do this just pytorch ops for now? torch.scatter
-                        # for that we would
-                        #   read the key
-                        #   figure out whether we are updating or clearing 
-                        #   calculate both!
-                        #   use torch.where to figure out which one we select
-                        #   scatter back
-                        # note this contains lots of memory traffic and is inefficient 
+                        # [num_blocks, head kv, h dim]
+                        pagemax = kf_cache[ld_indices]
+                        pagemin = vf_cache[ld_indices]
 
-
-                        # [blocks, page, kv head, d]
-                        block_k = key_cache[block_ids] 
-
-                        # mask blocks with zero for max/min update
-                        # for the actual kernel, we would use min/max paging to help calculate this 
-                        nb_pg_sz = block_k.shape[:2]
-                        block_k = block_k.flatten(0, 1)
-
-                        # Create mask for padded entries
-                        mask = torch.ones_like(block_k, dtype=torch.bool)
-                        mask[attn_metadata.seq_lens_cpu[i]:] = False
-
-                        # Set padded entries to -inf for max and +inf for min
-                        block_k_max = block_k.clone()
-                        block_k_min = block_k.clone()
-                        block_k_max[~mask] = float('-inf')
-                        block_k_min[~mask] = float('inf')
-
-                        # Unflatten back to original shape
-                        block_k_max = block_k_max.unflatten(0, nb_pg_sz)
-                        block_k_min = block_k_min.unflatten(0, nb_pg_sz)
-
-                        # [blocks, page size, kv head, h dim] -> [block, kv head, dim]
-                        pagemax = block_k_max.amax(dim=1)
-                        pagemin = block_k_min.amin(dim=1)
-
-                        # Restore original block_k
-                        block_k[attn_metadata.seq_lens_cpu[i]:] = 0
-                        block_k = block_k.unflatten(0, nb_pg_sz)
 
                         kv_heads = key.shape[1]
                         # [1, head kv, q group, h dim]
