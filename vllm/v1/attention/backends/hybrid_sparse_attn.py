@@ -941,7 +941,7 @@ class HybridSparseAttentionImpl(AttentionImpl):
                         g_offset = -g_offset.clamp_min(min=g_eps).log()
 
                         # adjust temperature to interploate between pure top-k and pure random sampling
-                        temperature = 0.5
+                        temperature = 0.0
                         qk_hat = qk_hat + temperature * g_offset
 
                         # force implicit selection of the last block
