@@ -914,26 +914,25 @@ class HybridSparseAttentionImpl(AttentionImpl):
                         # [1, head kv, q group, h dim]
                         q_slice = query[start_pos:end_pos].unflatten(1, (kv_heads, -1))
                         # final shape: [1, head kv, h dim]
-                        q_prime = q_slice.sum(2)
+                        q_prime = q_slice.mean(2)
 
                         # [blocks, head kv, h dim]
                         page_sel = torch.where(q_prime < 0, pagemin, pagemax)
 
 
-                        # collect along last dim, apply the same reduction to all in kv group
-                        # [1, head kv, q group, h dim]
-                        q_hat = q_slice
-                        q_hat = q_hat.squeeze(0) # [head kv, q group, h dim]
+                        # [head kv, 1, h dim]
+                        q_hat = q_prime.squeeze(0).unsqueeze(1)
+
                         # [blocks, head kv, h dim]
                         k_hat = page_sel
-                        k_hat = k_hat.transpose(0, 1) # push head to first dimension [head kv, blocks, r_comp]
-                        k_hat = k_hat.transpose(1, 2) # swap for attn comp
+                        k_hat = k_hat.transpose(0, 1)  # [head kv, blocks, h_dim]
+                        k_hat = k_hat.transpose(1, 2)  # [head kv, h_dim, blocks]
 
-                        # [head kv, q group, r_comp] x [head kv,  r_comp, blocks] = [head kv, q group, blocks]
+                        # [head kv, 1, h_dim] x [head kv, h_dim, blocks] = [head kv, 1, blocks]
                         qk_hat = torch.matmul(q_hat, k_hat)
 
                         # [blocks]
-                        qk_hat = qk_hat.mean(dim=1).mean(dim=0)
+                        qk_hat = qk_hat.squeeze(dim=1).mean(dim=0)
 
                         # generate gumbel noise and add to logits
                         g_eps = 1e-8
