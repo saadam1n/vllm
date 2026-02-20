@@ -4,6 +4,34 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
+@triton.jit
+def hsa_reduce_block(
+    key_ptr,
+    key_stride_0,
+    q_base,
+    q_end,
+    rblock_idx, 
+    FULL_KEY_DIM : tl.constexpr, # number of KV groups * hidden dim 
+    R_BLOCK_SIZE : tl.constexpr # reduction block size (used in prefill)
+):
+    off_tokens = tl.arange(0, R_BLOCK_SIZE) + R_BLOCK_SIZE * rblock_idx
+    off_key_dim = tl.arange(0, FULL_KEY_DIM)
+
+    # (BLOCK_SIZE, 1)
+    off_tokens = off_tokens[:, None]
+    # (1, FULL_KEY_DIM)
+    off_key_dim = off_key_dim[None, :]
+
+    ld_mask = (q_base + off_tokens < q_end)
+
+    keys = tl.load(key_ptr + key_stride_0 * (q_base + off_tokens) + off_key_dim, mask=ld_mask, other=float("-inf"))
+
+    rblock_keymax = tl.max(keys, axis=0)
+
+    keys = tl.where(ld_mask, keys, float("inf"))
+    rblock_keymin = tl.min(keys, axis=0)
+
+    return rblock_keymax, rblock_keymin
 
 # warmup example
 @triton.jit
@@ -17,7 +45,8 @@ def hsa_update_page_minmax(
     kv_stride_1 : int, # corresponds to stride of number of KV groups * hidden dim * sizeof(dtype)
     kv_top : int, # token with highest index in KV cache
     FULL_KEY_DIM : tl.constexpr, # number of KV groups * hidden dim 
-    BLOCK_SIZE : tl.constexpr
+    BLOCK_SIZE : tl.constexpr, # size of page in vLLM
+    R_BLOCK_SIZE : tl.constexpr # reduction block size (used in prefill)
 ):
     # launch dims:
     # [batch, blocks]
@@ -44,19 +73,33 @@ def hsa_update_page_minmax(
         # iterate through remaining blocks
         while q_base < q_end:
 
-            off_tokens = tl.arange(0, BLOCK_SIZE)
+            # iterate over page chunk size
+            num_tokens = min(q_base + BLOCK_SIZE, q_end) - q_base
+            num_rblocks = (num_tokens - 1) // R_BLOCK_SIZE + 1 # cdiv
 
+            running_keymax, running_keymin = hsa_reduce_block(
+                key_ptr=key_ptr,
+                key_stride_0=key_stride_0,
+                q_base=q_base,
+                q_end=q_end,
+                rblock_idx=0,
+                FULL_KEY_DIM=FULL_KEY_DIM,
+                R_BLOCK_SIZE=R_BLOCK_SIZE
+            )
 
-            off_key_dim = tl.arange(0, FULL_KEY_DIM)
+            for rblock_idx in range(1, num_rblocks):
+                rblock_keymax, rblock_keymin = hsa_reduce_block(
+                    key_ptr=key_ptr,
+                    key_stride_0=key_stride_0,
+                    q_base=q_base,
+                    q_end=q_end,
+                    rblock_idx=rblock_idx,
+                    FULL_KEY_DIM=FULL_KEY_DIM,
+                    R_BLOCK_SIZE=R_BLOCK_SIZE
+                )
 
-            # (BLOCK_SIZE, 1)
-            off_tokens = off_tokens[:, None]
-            # (1, FULL_KEY_DIM)
-            off_key_dim = off_key_dim[None, :]
-
-            ld_mask = (q_base + off_tokens < q_end)
-
-            keys = tl.load(key_ptr + key_stride_0 * (q_base + off_tokens) + off_key_dim, mask=ld_mask, other=float("-inf"))
+                running_keymax = tl.maximum(running_keymax, rblock_keymax)
+                running_keymin = tl.minimum(running_keymin, rblock_keymin)
 
             slot_idx = tl.load(slot_mapping_ptr + q_base)
             phys_block_idx = slot_idx // BLOCK_SIZE
@@ -66,10 +109,8 @@ def hsa_update_page_minmax(
             cache_max_ptr = key_cache_ptr   + kv_stride_1 * cache_slot_idx
             cache_min_ptr = value_cache_ptr + kv_stride_1 * cache_slot_idx
 
-            tl.store(cache_max_ptr + tl.arange(0, FULL_KEY_DIM), tl.max(keys, axis=0))
-
-            keys = tl.where(ld_mask, keys, float("inf"))
-            tl.store(cache_min_ptr + tl.arange(0, FULL_KEY_DIM), tl.min(keys, axis=0))
+            tl.store(cache_max_ptr + tl.arange(0, FULL_KEY_DIM), running_keymax)
+            tl.store(cache_min_ptr + tl.arange(0, FULL_KEY_DIM), running_keymin)
 
             q_base += BLOCK_SIZE * tl.num_programs(axis=1) 
     else:
@@ -130,6 +171,9 @@ def update_page_minmax(
     FULL_KEY_DIM = key_cache.shape[2] * key_cache.shape[3]
     BLOCK_SIZE = key_cache.shape[1]
 
+    assert BLOCK_SIZE % 4 == 0
+    R_BLOCK_SIZE = BLOCK_SIZE // 4
+
     # prefix sum increases dim by 1, so we need to subtract 1
     num_reqs = query_start_loc.shape[0] - 1
     num_blocks = 16
@@ -145,7 +189,8 @@ def update_page_minmax(
         kv_stride_1=key_cache.stride(1),
         kv_top=kv_top,
         FULL_KEY_DIM=FULL_KEY_DIM,
-        BLOCK_SIZE=BLOCK_SIZE
+        BLOCK_SIZE=BLOCK_SIZE,
+        R_BLOCK_SIZE=R_BLOCK_SIZE
     )
 
 
