@@ -57,7 +57,7 @@ from vllm.v1.attention.kvcompressor import (
 )
 
 from vllm.v1.attention.ops.triton_hsa_selection import (
-    update_page_minmax
+    select_top_pages
 )
 
 logger = init_logger(__name__)
@@ -871,106 +871,20 @@ class HybridSparseAttentionImpl(AttentionImpl):
                 # if we have all decode requests, we can make the block table a lot smaller 
                 # the number of columns is the maximum number of blocks used as per the HSA config
                 # side note: we can combine this with a LRU-style cache to find out which pages to evict
-
-                update_page_minmax(
-                    query_start_loc=cu_seqlens_q,
-                    slot_mapping=attn_metadata.slot_mapping,
-                    key=key,
-                    key_cache=key_cache,
-                    value_cache=value_cache
-                )
-
-
-                # pls do not create a copy
-                kf_cache = key_cache.flatten(0, 1)
-                vf_cache = value_cache.flatten(0, 1)
-
-                block_size = key_cache.shape[1]
-
                 scratch_table = attn_metadata.scratch_table
 
-                start_pos = 0
-                for i, qlen in enumerate(attn_metadata.query_len_cpu):
-                    end_pos = start_pos + qlen
-
-                    if qlen == 1:
-                        # Decode
-
-                        # hybrid sparse attention
-                        num_blocks = cdiv(attn_metadata.seq_lens_cpu[i], block_size)
-
-                        # [num_blocks]
-                        block_ids = block_table[i, :num_blocks]
-
-                        # [num_blocks]
-                        ld_indices = kf_cache.shape[0] - block_ids
-
-                        # [num_blocks, head kv, h dim]
-                        pagemax = kf_cache[ld_indices]
-                        pagemin = vf_cache[ld_indices]
-
-
-                        kv_heads = key.shape[1]
-                        # [1, head kv, q group, h dim]
-                        q_slice = query[start_pos:end_pos].unflatten(1, (kv_heads, -1))
-                        # final shape: [1, head kv, h dim]
-                        q_prime = q_slice.mean(2)
-
-                        # [blocks, head kv, h dim]
-                        page_sel = torch.where(q_prime < 0, pagemin, pagemax)
-
-
-                        # [head kv, 1, h dim]
-                        q_hat = q_prime.squeeze(0).unsqueeze(1)
-
-                        # [blocks, head kv, h dim]
-                        k_hat = page_sel
-                        k_hat = k_hat.transpose(0, 1)  # [head kv, blocks, h_dim]
-                        k_hat = k_hat.transpose(1, 2)  # [head kv, h_dim, blocks]
-
-                        # [head kv, 1, h_dim] x [head kv, h_dim, blocks] = [head kv, 1, blocks]
-                        qk_hat = torch.matmul(q_hat, k_hat)
-
-                        # [blocks]
-                        qk_hat = qk_hat.squeeze(dim=1).mean(dim=0)
-
-                        # generate gumbel noise and add to logits
-                        g_eps = 1e-8
-                        g_offset = torch.rand_like(qk_hat)
-                        g_offset = -g_offset.clamp_min(min=g_eps).log()
-                        g_offset = -g_offset.clamp_min(min=g_eps).log()
-
-                        # adjust temperature to interploate between pure top-k and pure random sampling
-                        temperature = 0.0
-                        qk_hat = qk_hat + temperature * g_offset
-
-                        # force implicit selection of the last block
-                        qk_hat[-1:] += 1000
-
-                        block_budget = min(num_blocks, attn_metadata.max_block_budget)
-
-                        # [block_budget]
-                        sel_blocks = torch.topk(qk_hat, block_budget, dim=-1).indices
-    
-                        # this is a band-aid fix and no sane person should ever use it
-                        # attention is invariant to the order in which tokens are fed to it,
-                        # however paging has specific requirements with how tokens in the last block are masked
-                        # that last block needs to come last in the block table
-                        # if it does not, then garbage data to the left of it will be attended to
-                        # which I suspect leads to degeneration
-                        # in the real kernel we would probably manually handle this... somehow
-                        # idk how to do it in triton but we could do the following in CUDA:
-                        #   if selected top k block is last
-                        #      smem swap with last block // no race conditions here
-                        sel_blocks = torch.sort(sel_blocks).values
-
-                        # [block_budget]
-                        sel_block_ids = torch.gather(block_ids, dim=0, index=sel_blocks)
-
-                        scratch_table[i, :block_budget] = sel_block_ids
-
-                    start_pos = end_pos
-
+                select_top_pages(
+                    query=query,
+                    key=key,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    seq_lens=seqused_k,
+                    block_table=attn_metadata.block_table,
+                    scratch_table=scratch_table,
+                    query_start_loc=cu_seqlens_q,
+                    slot_mapping=attn_metadata.slot_mapping,
+                    max_block_budget=attn_metadata.max_block_budget
+                )
 
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
