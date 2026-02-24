@@ -79,7 +79,9 @@ def hsa_select(
 
     q_len = q_end - q_start
 
-    if q_len > 1:
+    if q_len == 0:
+        return # empty batch
+    elif q_len > 1:
         # PREFILL BRANCH
         # notably, we assume there is no case of spec decode
         # that is, each block begins at the start of the block (no updates, only clears)

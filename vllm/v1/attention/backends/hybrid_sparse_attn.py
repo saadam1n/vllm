@@ -209,9 +209,6 @@ class HybridSparseAttentionMetadata:
     # Max blocks used in HSA decode requests
     max_block_budget : int
 
-    seq_lens_cpu : list[int]
-    query_len_cpu : list[int]
-
     # post-HSA block table (this is mutable!)
     scratch_table : torch.Tensor
     # post-HSA sequence length
@@ -342,6 +339,26 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
         self.max_block_budget = 16
         logger.warning(f"ALERT: max blocks for HSA has been hard-coded to {self.max_block_budget}! This needs to be changed into a vLLM argument at some point!")
 
+        # pre-allocate memory for compatibility with CUDA graphs
+        self.max_model_len = vllm_config.model_config.max_model_len
+        self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+        self.max_num_blocks_per_req = cdiv(self.max_model_len, self.block_size)
+
+        self.prefer_eager = False
+
+        self.persistent_scratch_table = torch.zeros(
+            self.max_num_reqs, 
+            self.max_num_blocks_per_req, 
+            dtype=torch.int32,
+            device=device
+        )
+
+        self.persistent_seq_lens = torch.zeros(
+            self.max_num_reqs, 
+            dtype=torch.int32,
+            device=device
+        )
+
     def build(
         self,
         common_prefix_len: int,
@@ -371,14 +388,22 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
 
         decode_req = (query_len == 1)
 
-        hsa_seqused_k = torch.where(decode_req, reqs_decode_seqlen, seq_lens)
-        scratch_table = torch.where(decode_req.unsqueeze(1), 0, block_table_tensor)
+        hsa_seq_lens = self.persistent_seq_lens[:num_reqs]
+        scratch_table = self.persistent_scratch_table[:num_reqs]
+
+        # TODO: merge these ops
+        hsa_seq_lens.copy_(
+            torch.where(decode_req, reqs_decode_seqlen, seq_lens)
+        )
+
+        scratch_table.copy_(
+            torch.where(decode_req.unsqueeze(1), 0, block_table_tensor)
+        )
+
+    
 
 
-        hsa_max_seqlen_k = reqs_decode_seqlen.amax().item()
-
-        seq_lens_cpu = common_attn_metadata.seq_lens.cpu().tolist()
-        query_len_cpu = query_len.cpu().tolist()
+        hsa_max_seqlen_k = reqs_decode_seqlen.amax().item() if self.prefer_eager else self.max_model_len
 
 
 
@@ -531,7 +556,6 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
             query_start_loc=query_start_loc,
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
             block_table=block_table_tensor,
             slot_mapping=slot_mapping,
             max_dcp_context_kv_len=max_dcp_context_kv_len,
@@ -545,12 +569,12 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_num_splits=max_num_splits,
             causal=causal,
-            query_len_cpu=query_len_cpu,
             max_block_budget=self.max_block_budget,
-            hsa_seqused_k=hsa_seqused_k,
+            hsa_seqused_k=hsa_seq_lens,
             hsa_max_seqlen_k=hsa_max_seqlen_k,
-            scratch_table=scratch_table
+            scratch_table=scratch_table,
         )
+
         return attn_metadata
 
     def update_block_table(
@@ -861,17 +885,11 @@ class HybridSparseAttentionImpl(AttentionImpl):
                     else None
                 )
 
-                # KV_COMPRESS: kernel WIP! 
-                # our goal is to compute a new block table and metadata (seqused_k, max_seqlen_k)
-                # we then pass this to flash attention
-
-                # in the case of having prefill requests, our block table may need an arbitrary amount of length
-                # for those requests, just copy the original block table entries to the new block table
-
-                # if we have all decode requests, we can make the block table a lot smaller 
-                # the number of columns is the maximum number of blocks used as per the HSA config
-                # side note: we can combine this with a LRU-style cache to find out which pages to evict
-                scratch_table = attn_metadata.scratch_table
+                # KV_COMPRESS: kernel completed! 
+                # - unbatched + torch SPDA (also unbatched): 32 tokens per second
+                # - unbatched + FlashAttention             : 60 tokenbs per second
+                # - custom kernel                          : 150 tokens per second
+                # - custom kernel + eager mode = false     : 156 tokens per second
 
                 select_top_pages(
                     query=query,
@@ -880,7 +898,7 @@ class HybridSparseAttentionImpl(AttentionImpl):
                     value_cache=value_cache,
                     seq_lens=seqused_k,
                     block_table=attn_metadata.block_table,
-                    scratch_table=scratch_table,
+                    scratch_table=attn_metadata.scratch_table,
                     query_start_loc=cu_seqlens_q,
                     slot_mapping=attn_metadata.slot_mapping,
                     max_block_budget=attn_metadata.max_block_budget
@@ -893,13 +911,13 @@ class HybridSparseAttentionImpl(AttentionImpl):
                     out=output[:num_actual_tokens],
                     cu_seqlens_q=cu_seqlens_q,
                     max_seqlen_q=max_seqlen_q,
-                    seqused_k=attn_metadata.hsa_seqused_k, # HSA SPECIFIC INPUT
-                    max_seqlen_k=attn_metadata.hsa_max_seqlen_k, # HSA SPECIFIC INPUT
+                    seqused_k=attn_metadata.hsa_seqused_k,
+                    max_seqlen_k=attn_metadata.hsa_max_seqlen_k, 
                     softmax_scale=self.scale,
                     causal=attn_metadata.causal,
                     alibi_slopes=self.alibi_slopes,
                     window_size=sliding_window_size,
-                    block_table=scratch_table, # HSA SPECIFIC INPUT
+                    block_table=attn_metadata.scratch_table,
                     softcap=self.logits_soft_cap,
                     scheduler_metadata=scheduler_metadata,
                     fa_version=self.vllm_flash_attn_version,
