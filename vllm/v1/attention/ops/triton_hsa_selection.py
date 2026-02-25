@@ -45,12 +45,14 @@ def hsa_select(
     scratch_table_ptr, # [batch, max blocks]
     query_start_loc_ptr, # [batch + 1,]
     slot_mapping_ptr, # [number of queries,]
+    rng_seeds_ptr, # [number of requests,]
     query_stride_0 : int, # stride of query_ptr dim 0
     key_stride_0 : int, # stride of key_ptr dim 0 (needed in some cases)
     kv_stride_1 : int, # corresponds to stride of number of KV groups * hidden dim * sizeof(dtype)
     block_table_stride_0 : int,
     kv_top : int, # token with highest index in KV cache
     MAX_BLOCK_BUDGET : tl.constexpr,
+    GUMBEL_TEMPERATURE : tl.constexpr,
     NUM_KV_GROUPS : tl.constexpr, # number of KV groups
     NUM_Q_PER_GROUP : tl.constexpr, # number of queries per group
     QK_HIDDEN_DIM : tl.constexpr, # hidden dim of queries and keys
@@ -145,6 +147,10 @@ def hsa_select(
         # for the rest of the HSA kernel, we use only one block
         if block_idx != 0:
             return
+
+        seed = 0
+        if GUMBEL_TEMPERATURE > 0.0:
+            seed = tl.load(rng_seeds_ptr + batch_idx)
 
         # decode
         key =  tl.load(key_ptr + key_stride_0 * q_start + tl.arange(0, FULL_KEY_DIM))
@@ -270,6 +276,17 @@ def hsa_select(
 
             # based on compairson with a reference impl using pytorch ops,
             # qk_hat should be correct
+            if GUMBEL_TEMPERATURE > 0.0:
+                eps = 1e-6
+
+                gumbel_noise = tl.rand(seed, tl.arange(0, QKH_BLOCK_SIZE))
+
+                gumbel_noise = -tl.log(tl.maximum(gumbel_noise, eps))
+                gumbel_noise = -tl.log(tl.maximum(gumbel_noise, eps))
+
+                qk_hat = qk_hat + GUMBEL_TEMPERATURE * gumbel_noise
+
+                seed = seed + 1
 
             # force last block to be selected
             qk_hat = tl.where(log_block_segm == num_kv_blocks - 1, pos_inf, qk_hat)
@@ -338,6 +355,9 @@ def hsa_select(
 
         tl.store(scratch_table_ptr + block_table_stride_0 * batch_idx + flush_k_offset, running_topk_idxs)
 
+        if GUMBEL_TEMPERATURE > 0.0:
+            tl.store(rng_seeds_ptr + batch_idx, seed)
+
 
 def select_top_pages(
     query : torch.Tensor,
@@ -349,7 +369,9 @@ def select_top_pages(
     scratch_table : torch.Tensor,
     query_start_loc : torch.Tensor,
     slot_mapping : torch.Tensor,
-    max_block_budget : int
+    rng_seeds : torch.Tensor,
+    max_block_budget : int,
+    gumbel_temperature : float
 ):
     assert query[0].is_contiguous(), "HSA kernels currently have limited support for non-contiguous tensors"
     assert key[0].is_contiguous(), "HSA kernels currently have limited support for non-contiguous tensors"
@@ -394,12 +416,14 @@ def select_top_pages(
         scratch_table_ptr       = scratch_table,
         query_start_loc_ptr     = query_start_loc,
         slot_mapping_ptr        = slot_mapping,
+        rng_seeds_ptr           = rng_seeds,
         query_stride_0          = query.stride(0),
         key_stride_0            = key.stride(0),
         kv_stride_1             = key_cache.stride(1),
         block_table_stride_0    = block_table.stride(0),
         kv_top                  = kv_top,
         MAX_BLOCK_BUDGET        = max_block_budget,
+        GUMBEL_TEMPERATURE      = gumbel_temperature,
         NUM_KV_GROUPS           = NUM_KV_GROUPS,
         NUM_Q_PER_GROUP         = NUM_Q_PER_GROUP,
         QK_HIDDEN_DIM           = QK_HIDDEN_DIM,

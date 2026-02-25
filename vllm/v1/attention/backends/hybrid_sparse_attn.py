@@ -216,6 +216,12 @@ class HybridSparseAttentionMetadata:
     # post-HSA max sequence length
     hsa_max_seqlen_k : int
 
+    # seeds for noise
+    rng_seeds : torch.Tensor
+
+    # gumbel temp (0.0 optimizes away that part of the kernel)
+    gumbel_temperature : float
+
     # For cascade attention.
     use_cascade: bool
     common_prefix_len: int
@@ -359,6 +365,17 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
             device=device
         )
 
+        # seeds for rng
+        self.rng_seeds = torch.randint(
+            0, 
+            (1 << 31) - 1, 
+            (self.max_num_reqs,),
+            dtype=torch.int32,
+            device=device
+        )
+
+        self.gumbel_temperature = 2.0
+
     def build(
         self,
         common_prefix_len: int,
@@ -400,12 +417,7 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
             torch.where(decode_req.unsqueeze(1), 0, block_table_tensor)
         )
 
-    
-
-
         hsa_max_seqlen_k = reqs_decode_seqlen.amax().item() if self.prefer_eager else self.max_model_len
-
-
 
         # the overhead of the aot schedule is not worth it for spec-decode
         aot_schedule = self.aot_schedule and not fast_build
@@ -573,6 +585,8 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
             hsa_seqused_k=hsa_seq_lens,
             hsa_max_seqlen_k=hsa_max_seqlen_k,
             scratch_table=scratch_table,
+            rng_seeds=self.rng_seeds[:num_reqs],
+            gumbel_temperature=self.gumbel_temperature
         )
 
         return attn_metadata
@@ -901,7 +915,9 @@ class HybridSparseAttentionImpl(AttentionImpl):
                     scratch_table=attn_metadata.scratch_table,
                     query_start_loc=cu_seqlens_q,
                     slot_mapping=attn_metadata.slot_mapping,
-                    max_block_budget=attn_metadata.max_block_budget
+                    rng_seeds=attn_metadata.rng_seeds,
+                    max_block_budget=attn_metadata.max_block_budget,
+                    gumbel_temperature=attn_metadata.gumbel_temperature
                 )
 
                 flash_attn_varlen_func(
