@@ -41,6 +41,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
         backend.get_class()
     """
 
+    #FLASH_ATTN = "vllm.v1.attention.backends.flash_attn.FlashAttentionBackend"
     FLASH_ATTN = "vllm.v1.attention.backends.hybrid_sparse_attn.HybridSparseAttentionBackend"
     FLASH_ATTN_DIFFKV = (
         "vllm.v1.attention.backends.flash_attn_diffkv.FlashAttentionDiffKVBackend"

@@ -186,7 +186,21 @@ def hsa_select(
             tl.store(cached_addr, running_bounds)
 
         # begin the actual HSA kernel
-        # we first need to load the query
+        # first check if we can skip HSA kernel for small block sizes
+        seq_len = tl.load(seq_lens_ptr + batch_idx)
+        num_kv_blocks = (seq_len - 1) // KV_BLOCK_SIZE + 1 # cdiv
+
+        if num_kv_blocks <= MAX_BLOCK_BUDGET:
+            mbb = tl.arange(0, MAX_BLOCK_BUDGET)
+
+            phys_block_ids = tl.load(
+                block_table_ptr + block_table_stride_0 * batch_idx + mbb
+            )
+
+            tl.store(scratch_table_ptr + block_table_stride_0 * batch_idx + mbb, phys_block_ids)
+
+
+        # if we need to do HSA, first need to load the query
 
         # TODO: switch from brute force method to a tiled load
         # might not be necessary if triton is smart enough and does this all in registers
@@ -218,9 +232,7 @@ def hsa_select(
         # [NUM_KV_GROUPS * QK_HIDDEN_DIM]
         q_negative = (query < 0)
 
-        seq_len = tl.load(seq_lens_ptr + batch_idx)
 
-        num_kv_blocks = (seq_len - 1) // KV_BLOCK_SIZE + 1 # cdiv
         num_qkh_blocks = (num_kv_blocks - 1) // QKH_BLOCK_SIZE + 1 # cdiv
 
         pos_inf = 3e5
@@ -399,7 +411,7 @@ def select_top_pages(
     # QKH_BLOCK_SIZE controls how many KV pages we score per inner loop iteration.
     # 16 is a reasonable default: large enough to amortize loop overhead and
     # keep the tl.dot tile non-trivial, small enough to stay in registers.
-    QKH_BLOCK_SIZE = 4
+    QKH_BLOCK_SIZE = 16
 
     # prefix sum increases dim by 1, so we need to subtract 1
     num_reqs   = query_start_loc.shape[0] - 1

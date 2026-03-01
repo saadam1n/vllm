@@ -6,6 +6,8 @@ import copy
 from dataclasses import dataclass
 from typing import ClassVar
 
+import math
+
 import numpy as np
 import torch
 
@@ -374,7 +376,7 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
             device=device
         )
 
-        self.gumbel_temperature = 2.0
+        self.gumbel_temperature = 1.0
 
     def build(
         self,
