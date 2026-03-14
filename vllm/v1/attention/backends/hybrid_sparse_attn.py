@@ -59,7 +59,8 @@ from vllm.v1.attention.kvcompressor import (
 )
 
 from vllm.v1.attention.ops.triton_hsa_selection import (
-    select_top_pages
+    consolidate_per_head_selection,
+    select_top_pages,
 )
 
 logger = init_logger(__name__)
@@ -209,7 +210,7 @@ class HybridSparseAttentionMetadata:
     slot_mapping: torch.Tensor
 
     # Max blocks used in HSA decode requests
-    max_block_budget : int
+    topk_token_budget : int
 
     # post-HSA block table (this is mutable!)
     scratch_table : torch.Tensor
@@ -218,11 +219,8 @@ class HybridSparseAttentionMetadata:
     # post-HSA max sequence length
     hsa_max_seqlen_k : int
 
-    # seeds for noise
-    rng_seeds : torch.Tensor
-
-    # gumbel temp (0.0 optimizes away that part of the kernel)
-    gumbel_temperature : float
+    pool_block_size : int
+    topk_token_budget : int
 
     # For cascade attention.
     use_cascade: bool
@@ -344,8 +342,14 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
         # populated on first build() call.
         self.aot_sliding_window: tuple[int, int] | None = None
 
-        self.max_block_budget = 16
-        logger.warning(f"ALERT: max blocks for HSA has been hard-coded to {self.max_block_budget}! This needs to be changed into a vLLM argument at some point!")
+        self.pool_block_size = 2
+        logger.warning(f"ALERT: pool block size for HSA has been hard-coded to {self.pool_block_size}! This needs to be changed into a vLLM argument at some point!")
+
+
+        self.topk_token_budget = 256
+        logger.warning(f"ALERT: top-k token budget for HSA has been hard-coded to {self.topk_token_budget}! This needs to be changed into a vLLM argument at some point!")
+
+        self.topk_num_pool_blocks = self.topk_token_budget // self.pool_block_size
 
         # pre-allocate memory for compatibility with CUDA graphs
         self.max_model_len = vllm_config.model_config.max_model_len
@@ -367,16 +371,6 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
             device=device
         )
 
-        # seeds for rng
-        self.rng_seeds = torch.randint(
-            0, 
-            (1 << 31) - 1, 
-            (self.max_num_reqs,),
-            dtype=torch.int32,
-            device=device
-        )
-
-        self.gumbel_temperature = 1.0
 
     def build(
         self,
@@ -400,10 +394,10 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
         causal = common_attn_metadata.causal
 
         # perform cdiv
-        reqs_num_blocks = torch.floor_divide(seq_lens - 1, self.block_size) + 1
-        reqs_decode_budget = reqs_num_blocks.clamp_max(self.max_block_budget)
+        reqs_num_blocks = torch.floor_divide(seq_lens - 1, self.pool_block_size) + 1
+        reqs_decode_budget = reqs_num_blocks.clamp_max(self.topk_num_pool_blocks)
 
-        reqs_decode_seqlen = (reqs_decode_budget - reqs_num_blocks) * self.block_size + seq_lens
+        reqs_decode_seqlen = (reqs_decode_budget - reqs_num_blocks) * self.pool_block_size + seq_lens
 
         decode_req = (query_len == 1)
 
@@ -583,12 +577,11 @@ class HybridSparseAttentionMetadataBuilder(AttentionMetadataBuilder[HybridSparse
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_num_splits=max_num_splits,
             causal=causal,
-            max_block_budget=self.max_block_budget,
             hsa_seqused_k=hsa_seq_lens,
             hsa_max_seqlen_k=hsa_max_seqlen_k,
             scratch_table=scratch_table,
-            rng_seeds=self.rng_seeds[:num_reqs],
-            gumbel_temperature=self.gumbel_temperature
+            pool_block_size=self.pool_block_size,
+            topk_token_budget=self.topk_token_budget
         )
 
         return attn_metadata
@@ -907,25 +900,37 @@ class HybridSparseAttentionImpl(AttentionImpl):
                 # - custom kernel                          : 150 tokens per second
                 # - custom kernel + eager mode = false     : 156 tokens per second
 
-                select_top_pages(
-                    query=query,
-                    key=key,
+                if False:
+                    select_top_pages(
+                        query=query,
+                        key=key,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        seq_lens=seqused_k,
+                        block_table=attn_metadata.block_table,
+                        scratch_table=attn_metadata.scratch_table,
+                        query_start_loc=cu_seqlens_q,
+                        slot_mapping=attn_metadata.slot_mapping,
+                        pool_block_size=attn_metadata.pool_block_size,
+                        topk_token_budget=attn_metadata.topk_token_budget,
+                    )
+
+                k2, v2, bt2 = consolidate_per_head_selection(
                     key_cache=key_cache,
                     value_cache=value_cache,
-                    seq_lens=seqused_k,
                     block_table=attn_metadata.block_table,
                     scratch_table=attn_metadata.scratch_table,
                     query_start_loc=cu_seqlens_q,
-                    slot_mapping=attn_metadata.slot_mapping,
-                    rng_seeds=attn_metadata.rng_seeds,
-                    max_block_budget=attn_metadata.max_block_budget,
-                    gumbel_temperature=attn_metadata.gumbel_temperature
+                    seq_lens=seqused_k,
+                    pool_block_size=attn_metadata.pool_block_size,
+                    topk_token_budget=attn_metadata.topk_token_budget,
+                    streaming_llm=True
                 )
 
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
-                    k=key_cache,
-                    v=value_cache,
+                    k=k2,
+                    v=v2,
                     out=output[:num_actual_tokens],
                     cu_seqlens_q=cu_seqlens_q,
                     max_seqlen_q=max_seqlen_q,
@@ -935,7 +940,7 @@ class HybridSparseAttentionImpl(AttentionImpl):
                     causal=attn_metadata.causal,
                     alibi_slopes=self.alibi_slopes,
                     window_size=sliding_window_size,
-                    block_table=attn_metadata.scratch_table,
+                    block_table=bt2,
                     softcap=self.logits_soft_cap,
                     scheduler_metadata=scheduler_metadata,
                     fa_version=self.vllm_flash_attn_version,
